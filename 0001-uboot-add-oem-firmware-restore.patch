@@ -17,6 +17,17 @@ web failsafe UI and actually survives the next reboot:
   * bootmenu_mtd.c / bootmenu_common.h: register the 'oem' upgrade target
     and a matching boot menu entry.
 
+Build fix (v2):
+  * mtd_helper.c now calls crc32_no_comp() from <u-boot/crc.h>, but
+    <linux/crc32.h> is already in scope through the headers included above
+    it and defines a function-like crc32() macro. Left defined, that macro
+    rewrites the crc32() prototype at <u-boot/crc.h>:59 into invalid syntax
+    and the build dies with:
+        include/u-boot/crc.h:59: error: expected declaration specifiers or
+        '...' before '(' token
+    The macro is unused in this file, so it is now #undef'ed directly before
+    the include that needs it.
+
 Apply with:
     git apply 0001-uboot-add-oem-firmware-restore.patch
 Fallback if your tree normalises EOLs differently:
@@ -24,23 +35,38 @@ Fallback if your tree normalises EOLs differently:
     patch -p1 -l < 0001-uboot-add-oem-firmware-restore.patch
 
 ---
- mtd_helper.c          |  41 +++++++++++++++++++++++++++++++++++++++++
+ mtd_helper.c          |  56 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  bootmenu_common.h     |   2 ++
- bootmenu_mtd_common.c |  74 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ bootmenu_mtd_common.c |  74 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  bootmenu_mtd.c        |  11 +++++++++++
- 4 files changed, 128 insertions(+), 0 deletions(-)
+ 4 files changed, 143 insertions(+), 0 deletions(-)
 ---
 --- a/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
 +++ b/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
-@@ -31,6 +31,7 @@
- #include "bsp_conf.h"
+@@ -32,6 +32,22 @@
  #include "rootdisk.h"
  #include "untar.h"
-+#include <u-boot/crc.h>
  
++/*
++ * <linux/crc32.h>, pulled in transitively by the headers above, defines a
++ * function-like crc32(seed, data, length) macro. While that macro is in
++ * scope it rewrites the crc32() prototype inside <u-boot/crc.h> into
++ * invalid syntax and the build dies with:
++ *
++ *   include/u-boot/crc.h:59: error: expected declaration specifiers or
++ *   '...' before '(' token
++ *
++ * Nothing in this file uses the macro, so drop it before pulling that
++ * header in. Doing it after the include would be too late: the damage
++ * happens while <u-boot/crc.h> itself is being parsed.
++ */
++#undef crc32
++#include <u-boot/crc.h>
++
  #define PART_FIT_NAME		"fit"
  #define PART_UBI_NAME		"ubi"
-@@ -670,6 +671,32 @@
+ 
+@@ -670,6 +686,32 @@
  				  ii->ubi_size + ii->marker_size, true);
  }
  
@@ -73,7 +99,7 @@ Fallback if your tree normalises EOLs differently:
  static int mount_ubi(struct mtd_info *mtd, bool create)
  {
  	int ret;
-@@ -677,6 +704,20 @@
+@@ -677,6 +719,20 @@
  	ret = ubi_part(mtd->name, NULL);
  	if (ret) {
  		if (create) {
