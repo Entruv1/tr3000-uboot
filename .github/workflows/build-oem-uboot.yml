@@ -1,12 +1,19 @@
-# 云端编译「能安全刷原厂固件」的 U-Boot（FIP）
+# 云端编译「能按官方布局引导、也能安全刷原厂固件」的 U-Boot（FIP）
 #
 # 用法：
 #   1. 本文件放到仓库的 .github/workflows/ 下
-#   2. 0001-uboot-add-oem-firmware-restore.patch 放到仓库根目录
+#   2. 0001-uboot-add-oem-firmware-restore.patch 与
+#      0002-uboot-boot-vendor-layout.patch 放到仓库根目录
 #   3. Actions -> Build OEM-flashable U-Boot (FIP) -> Run workflow
 #
 # 产物：Artifacts 里的
 #   fip-mt7981_cudy_tr3000-v1-256mb_2025-Yuzhii-dhcpd-fixed-parts_md5-<hash>.bin
+#   bl2-mt7981_cudy_tr3000-v1-256mb_2025_md5-<hash>.bin
+#
+# 两个补丁的分工：
+#   0001  让网页 failsafe 能「原样直写」整份原厂 UBI 镜像（写进去不被抹掉）
+#   0002  让这台 U-Boot 真的会去引导：补回缺失的 bootcmd，并在引导原厂
+#         kernel 卷时自己补上 MTK 的 UBI rootfs 参数
 
 name: Build OEM-flashable U-Boot (FIP)
 
@@ -18,11 +25,15 @@ permissions:
 
 env:
   UPSTREAM_REPO: https://github.com/weekdaycare/bl-mt798x-dhcpd
-  UPSTREAM_REF: master
+  # 钉死到已验证过的上游 commit，避免上游变更让补丁突然应用失败。
+  # 想升级上游时，改这里并重新跑一次「校验补丁已生效」那一步确认即可。
+  UPSTREAM_REF: f6b361ed80012244b1ed33be1b5080b4d65e83fb
   BOARD: cudy_tr3000-v1-256mb
   FIP_VERSION: "2025"
   VARIANT: default
-  PATCH_FILE: 0001-uboot-add-oem-firmware-restore.patch
+  PATCH_FILES: >-
+    0001-uboot-add-oem-firmware-restore.patch
+    0002-uboot-boot-vendor-layout.patch
 
 jobs:
   build:
@@ -38,8 +49,11 @@ jobs:
       - name: 克隆上游 U-Boot 源码
         run: |
           set -e
-          git clone --depth 1 --branch "$UPSTREAM_REF" "$UPSTREAM_REPO" src
-          echo "src/ 顶层：$(ls src | tr '\n' ' ')"
+          git clone "$UPSTREAM_REPO" src
+          cd src
+          git checkout --detach "$UPSTREAM_REF"
+          echo "上游 commit：$(git rev-parse HEAD)"
+          echo "src/ 顶层：$(ls | tr '\n' ' ')"
 
       - name: 安装编译依赖
         run: |
@@ -48,30 +62,42 @@ jobs:
           sudo apt-get -qq install $(cat src/depends/ubuntu-22.04)
           sudo apt-get -qq install rename tar
 
-      - name: 应用补丁
+      - name: 依序应用补丁
         run: |
           set -e
-          P="$GITHUB_WORKSPACE/$PATCH_FILE"
-          test -f "$P" || { echo "找不到补丁：$P"; exit 1; }
           cd src
-          if git apply --verbose "$P"; then
-            echo "==> git apply 成功"
-          elif git apply --ignore-whitespace "$P"; then
-            echo "==> git apply --ignore-whitespace 成功"
-          else
-            echo "==> 退回 patch -p1"
-            patch -p1 -l < "$P"
-          fi
+          for P in $PATCH_FILES; do
+            F="$GITHUB_WORKSPACE/$P"
+            test -f "$F" || { echo "找不到补丁：$F"; exit 1; }
+            echo "==> 应用 $P"
+            if git apply --verbose "$F"; then
+              echo "    git apply 成功"
+            elif git apply --ignore-whitespace "$F"; then
+              echo "    git apply --ignore-whitespace 成功"
+            else
+              echo "    退回 patch -p1"
+              patch -p1 -l < "$F"
+            fi
+          done
 
       - name: 校验补丁已生效
         run: |
           set -e
           C=src/uboot-mtk-20250711/board/mediatek/common
+
+          # ---- 0001：原样直写原厂整包 UBI ----
           grep -q "mtd_part_has_ubi_image" "$C/mtd_helper.c"
           grep -q "generic_mtd_write_oem"  "$C/bootmenu_mtd_common.c"
           grep -q "generic_mtd_write_oem"  "$C/bootmenu_common.h"
           grep -q 'abbr = "oem"'           "$C/bootmenu_mtd.c"
-          echo "==> 补丁校验通过：4 个文件全部命中"
+
+          # ---- 0002：真的会引导 + 补上原厂 rootfs 参数 ----
+          grep -q 'env_set("bootcmd", "mtkboardboot")' "$C/bootmenu_mtd.c"
+          grep -q "mtd_vendor_bootargs_setup"          "$C/mtd_helper.c"
+          grep -q 'bootargs_set("ubi.rootfs_volume"'   "$C/mtd_helper.c"
+          grep -q 'bootargs_set("boot_param.rootfs_data_part"' "$C/mtd_helper.c"
+
+          echo "==> 补丁校验通过：两个补丁全部命中"
 
       - name: 编译 FIP
         run: |
