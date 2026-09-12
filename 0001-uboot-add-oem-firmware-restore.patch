@@ -1,0 +1,221 @@
+From: custom
+Subject: [PATCH] mt798x u-boot: add safe OEM (raw UBI) firmware restore path
+
+Adds three guardrails so a whole-image vendor firmware (a complete UBI image
+obtained by splitting the stock sysupgrade package) can be flashed from the
+web failsafe UI and actually survives the next reboot:
+
+  * mtd_helper.c: mount_ubi() refuses to auto-rebuild when the partition
+    already contains a valid UBI image. Previously it erased the whole
+    partition on every attach failure, which wiped freshly flashed firmware.
+    The UBI EC-header magic/CRC are parsed by hand, so no byteorder header
+    dependency is introduced.
+  * bootmenu_mtd_common.c: new generic_mtd_write_oem() writes the image raw
+    into the 'ubi' partition (full-partition erase + write + read-back
+    verify, no image parsing, no UBI mount). generic_mtd_write_fw() now
+    routes "UBI#" magic images to it automatically.
+  * bootmenu_mtd.c / bootmenu_common.h: register the 'oem' upgrade target
+    and a matching boot menu entry.
+
+Apply with:
+    git apply 0001-uboot-add-oem-firmware-restore.patch
+Fallback if your tree normalises EOLs differently:
+    git apply --ignore-whitespace 0001-uboot-add-oem-firmware-restore.patch
+    patch -p1 -l < 0001-uboot-add-oem-firmware-restore.patch
+
+---
+ mtd_helper.c          |  41 +++++++++++++++++++++++++++++++++++++++++
+ bootmenu_common.h     |   2 ++
+ bootmenu_mtd_common.c |  74 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ bootmenu_mtd.c        |  11 +++++++++++
+ 4 files changed, 128 insertions(+), 0 deletions(-)
+---
+--- a/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
++++ b/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
+@@ -31,6 +31,7 @@
+ #include "bsp_conf.h"
+ #include "rootdisk.h"
+ #include "untar.h"
++#include <u-boot/crc.h>
+ 
+ #define PART_FIT_NAME		"fit"
+ #define PART_UBI_NAME		"ubi"
+@@ -670,6 +671,32 @@
+ 				  ii->ubi_size + ii->marker_size, true);
+ }
+ 
++/*
++ * Return true when the partition already holds a UBI image
++ * (valid "UBI#" erase-counter header with a matching CRC32).
++ */
++static bool mtd_part_has_ubi_image(struct mtd_info *mtd)
++{
++	u8 hdr[64];
++	size_t retlen = 0;
++	u32 hcrc, crc;
++	int ret;
++
++	ret = mtd_read(mtd, 0, sizeof(hdr), &retlen, hdr);
++	if (ret || retlen != sizeof(hdr))
++		return false;
++
++	if (memcmp(hdr, "UBI#", 4))
++		return false;
++
++	/* The EC header CRC32 sits big-endian in the last 4 header bytes. */
++	hcrc = ((u32)hdr[60] << 24) | ((u32)hdr[61] << 16) |
++	       ((u32)hdr[62] << 8) | (u32)hdr[63];
++	crc = crc32_no_comp(0xFFFFFFFF, hdr, 60);
++
++	return crc == hcrc;
++}
++
+ static int mount_ubi(struct mtd_info *mtd, bool create)
+ {
+ 	int ret;
+@@ -677,6 +704,20 @@
+ 	ret = ubi_part(mtd->name, NULL);
+ 	if (ret) {
+ 		if (create) {
++			/*
++			 * Attach failed but the partition already contains a UBI
++			 * image: that is a layout/format incompatibility, NOT an
++			 * empty partition. Never auto-rebuild here -- rebuilding
++			 * means erasing the image the user just flashed.
++			 */
++			if (mtd_part_has_ubi_image(mtd)) {
++				cprintln(CAUTION, "*** Failed to attach UBI ***");
++				cprintln(CAUTION, "*** A UBI image exists on '%s' but cannot be attached ***",
++					 mtd->name);
++				cprintln(CAUTION, "*** Refusing to auto-rebuild. Data preserved. ***");
++				return -EBADMSG;
++			}
++
+ 			cprintln(CAUTION, "*** Failed to attach UBI ***");
+ 			cprintln(NORMAL, "*** Rebuilding UBI ***");
+ 
+--- a/uboot-mtk-20250711/board/mediatek/common/bootmenu_common.h
++++ b/uboot-mtk-20250711/board/mediatek/common/bootmenu_common.h
+@@ -76,6 +76,8 @@
+ 
+ int generic_mtd_write_fw(void *priv, const struct data_part_entry *dpe,
+ 			 const void *data, size_t size);
++int generic_mtd_write_oem(void *priv, const struct data_part_entry *dpe,
++			  const void *data, size_t size);
+ 
+ #ifdef CONFIG_MTK_CHAINLOAD_BL
+ int generic_mtd_write_next_bl(void *priv, const struct data_part_entry *dpe,
+--- a/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd_common.c
++++ b/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd_common.c
+@@ -443,10 +443,84 @@
+ 	return write_mtd_part(PART_FIP_NAME, buf, new_fip_size, true);
+ }
+ 
++/* OEM firmware lives in the 'ubi' partition (PART_UBI_NAME is private
++ * to mtd_helper.c, so spell it out here).
++ */
++#define OEM_UBI_PART_NAME	"ubi"
++
++/*
++ * Raw whole-image write of an OEM firmware (a complete UBI image produced by
++ * splitting the vendor sysupgrade package) into the 'ubi' partition.
++ *
++ * Differences from the regular 'fw' path:
++ *   1) erases the WHOLE partition first, so stale UBI metadata beyond the
++ *      image size cannot confuse a later ubi attach;
++ *   2) never parses the image, never mounts UBI and never triggers
++ *      "*** Rebuilding UBI ***";
++ *   3) read-back verifies the write.
++ */
++int generic_mtd_write_oem(void *priv, const struct data_part_entry *dpe,
++			  const void *data, size_t size)
++{
++	struct mtd_info *mtd;
++	int ret;
++
++	if (!size) {
++		cprintln(ERROR, "*** Empty image ***");
++		return -EINVAL;
++	}
++
++	mtd = get_mtd_part(OEM_UBI_PART_NAME);
++	if (IS_ERR(mtd))
++		return -PTR_ERR(mtd);
++
++	if (size > mtd->size) {
++		cprintln(ERROR, "*** Image too large (0x%zx > 0x%llx) ***",
++			 size, (unsigned long long)mtd->size);
++		put_mtd_device(mtd);
++		return -E2BIG;
++	}
++
++	if (size % mtd->erasesize) {
++		cprintln(ERROR, "*** Image size not erase-block aligned (0x%zx / 0x%x) ***",
++			 size, mtd->erasesize);
++		put_mtd_device(mtd);
++		return -EINVAL;
++	}
++
++	cprintln(PROMPT, "*** Writing OEM UBI image to '%s' ***", OEM_UBI_PART_NAME);
++	cprintln(PROMPT, "*** Image size: 0x%zx bytes ***", size);
++
++	ret = mtd_erase_skip_bad(mtd, 0, mtd->size, mtd->size,
++				 NULL, NULL, NULL, false);
++	if (ret) {
++		cprintln(ERROR, "*** Erase failed (%d) ***", ret);
++		goto out;
++	}
++
++	ret = mtd_write_skip_bad(mtd, 0, size, mtd->size, NULL, data, true);
++	if (ret)
++		cprintln(ERROR, "*** Write failed (%d) ***", ret);
++	else
++		cprintln(NORMAL, "*** OEM firmware written and verified ***");
++
++out:
++	put_mtd_device(mtd);
++
++	return ret;
++}
++
+ int generic_mtd_write_fw(void *priv, const struct data_part_entry *dpe,
+ 			 const void *data, size_t size)
+ {
+ 	int ret = 0;
++
++	/*
++	 * A raw UBI image ("UBI#" magic) is a complete vendor firmware image:
++	 * route it to the dedicated raw write path.
++	 */
++	if (size >= 4 && !memcmp(data, "UBI#", 4))
++		return generic_mtd_write_oem(priv, dpe, data, size);
+ 
+ 	ret = mtd_upgrade_image(data, size);
+ 	if (ret)
+--- a/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd.c
++++ b/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd.c
+@@ -68,6 +68,13 @@
+ 		.write = generic_mtd_write_fw,
+ 	},
+ 	{
++		.name = "OEM firmware (raw UBI)",
++		.abbr = "oem",
++		.env_name = "bootfile.oem",
++		.post_action = UPGRADE_ACTION_BOOT,
++		.write = generic_mtd_write_oem,
++	},
++	{
+ 		.name = "Factory",
+ 		.abbr = "factory",
+ 		.env_name = "bootfile.factory",
+@@ -125,6 +132,10 @@
+ 		.cmd = "mtkupgrade fw"
+ 	},
+ 	{
++		.desc = "Restore OEM firmware (raw UBI)",
++		.cmd = "mtkupgrade oem"
++	},
++	{
+ 		.desc = "Upgrade ATF BL2",
+ 		.cmd = "mtkupgrade bl2"
+ 	},
