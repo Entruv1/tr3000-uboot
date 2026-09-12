@@ -1,0 +1,100 @@
+diff --git a/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd.c b/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd.c
+index 8bf139d..d7ed795 100644
+--- a/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd.c
++++ b/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd.c
+@@ -5,6 +5,7 @@
+  * Author: Weijie Gao <weijie.gao@mediatek.com>
+  */
+ 
++#include <env.h>
+ #include <hang.h>
+ #include "bootmenu_common.h"
+ #include "autoboot_helper.h"
+@@ -210,5 +211,23 @@ void default_boot_set_defaults(void *fdt)
+ 
+ int board_late_init(void)
+ {
++	const char *bootcmd = env_get("bootcmd");
++
++	/*
++	 * Nothing in this tree defines CONFIG_BOOTCOMMAND, and no code here
++	 * consumes the DTS /config node either, so 'bootcmd' can only ever come
++	 * from the environment partition. Once that partition is empty or has
++	 * been rewritten by other firmware -- including this U-Boot's own web
++	 * failsafe, which only persists the variables it cares about -- the
++	 * board ends up with no 'bootcmd' at all. Autoboot then does nothing:
++	 * BL2, the FIP and the UBI image are all intact, but the board is
++	 * unreachable over the network and looks bricked.
++	 *
++	 * Put the MTK default back before main_loop() gets a chance to run.
++	 * This only ever fills a hole; an existing value is never touched.
++	 */
++	if (!bootcmd || !bootcmd[0])
++		env_set("bootcmd", "mtkboardboot");
++
+ 	return 0;
+ }
+diff --git a/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c b/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
+index b0996da..8a0c214 100644
+--- a/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
++++ b/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
+@@ -1410,6 +1410,50 @@ static int ubi_dual_boot(struct mtd_info *mtd, bool do_boot)
+ 	return dual_boot(&mtddb.db, do_boot);
+ }
+ 
++/*
++ * Vendor images (the stock MTK-SDK / OpenWrt firmware) keep the kernel FIT in
++ * the UBI volume named "kernel" and the squashfs root filesystem in the
++ * volume named "rootfs". Their embedded /chosen/bootargs carries only the
++ * console settings -- the kernel has to be *told* which UBI volume is the
++ * root filesystem, through the MTK parameters below.
++ *
++ * On the stock bootloader those parameters come from a factory environment
++ * that stops existing as soon as anything else writes the env partition, and
++ * the kernel then panics with "VFS: Unable to mount root fs" and reboot-loops
++ * forever. Rebuild them here.
++ *
++ * Only the "kernel" volume is affected. Images booted from the "fit" volume
++ * (our own layout, and OpenWrt's ubootmod) carry a complete command line of
++ * their own and are deliberately left alone.
++ *
++ * The values mirror what MediaTek's own ubi_set_bootargs() puts on the kernel
++ * command line for a non-secure-boot build -- note there is no 'root=': the
++ * kernel resolves the root filesystem from ubi.rootfs_volume itself.
++ */
++static void mtd_vendor_bootargs_setup(void)
++{
++	if (!ubi_image_vol || strcmp(ubi_image_vol, PART_KERNEL_NAME))
++		return;
++
++	cprintln(PROMPT, "*** Vendor '%s' volume found: supplying MTK UBI bootargs ***",
++		 PART_KERNEL_NAME);
++
++	/*
++	 * A stale command line from a previous firmware would otherwise be
++	 * applied on top of ours by fdt_chosen(), so start from a clean slate.
++	 */
++	env_set("bootargs", NULL);
++
++	bootargs_set("ubi.mtd", PART_UBI_NAME);
++	bootargs_set("ubi.rootfs_volume", "rootfs");
++	bootargs_set("boot_param.boot_kernel_part", PART_KERNEL_NAME);
++	bootargs_set("boot_param.boot_rootfs_part", "rootfs");
++	bootargs_set("boot_param.upgrade_kernel_part", PART_KERNEL_NAME);
++	bootargs_set("boot_param.upgrade_rootfs_part", "rootfs");
++	bootargs_set("boot_param.env_part", CONFIG_ENV_MTD_DEV);
++	bootargs_set("boot_param.rootfs_data_part", PART_ROOTFS_DATA_NAME);
++}
++
+ static int boot_from_ubi(struct mtd_info *mtd, bool do_boot)
+ {
+ 	const char *volname_primary, *volname_secondary;
+@@ -1443,6 +1487,8 @@ static int boot_from_ubi(struct mtd_info *mtd, bool do_boot)
+ 		ubi_image_vol = volname_primary;
+ 	}
+ 
++	mtd_vendor_bootargs_setup();
++
+ 	ret = mtd_set_fdtargs_basic();
+ 	if (ret)
+ 		return ret;
