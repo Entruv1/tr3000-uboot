@@ -1,0 +1,118 @@
+From: custom
+Subject: [PATCH] mt7981 cudy tr3000 256mb: drop the hard-coded mtd-layout cmdline
+
+0004 gave the "default" layout a cmdline of its own:
+
+    cmdline = "console=ttyS0,115200n1 loglevel=8 ubi.mtd=ubi";
+
+board_mtdparts_default() exports that through the `bootargs` environment
+variable, and fdt_chosen() *replaces* the FIT's /chosen/bootargs wholesale
+whenever that variable is non-empty. So the command line the factory image
+carries about itself got thrown away.
+
+Dumping the factory bootloader and the factory image says that is the wrong
+direction. The factory FIP contains no `console=`, no `earlycon` and no
+`bootargs=` string at all; its only mtd-related literal is a built-in
+
+    nmbm0:1024k(bl2),512k(u-boot-env),2048k(factory),256k(bdinfo),2048k(fip),235520k(ubi)
+
+The factory kernel FIT in the UBI carries
+
+    console=ttyS0,115200n1 loglevel=8 earlycon=uart8250,mmio32,0x11002000
+
+in /chosen/bootargs, and the UBI volume table is the usual
+kernel / rootfs / rootfs_data. The factory image therefore boots off its own
+command line, with no bootargs variable in the environment at all, and none
+of the ubi.rootfs_volume / boot_param.* entries 0002 used to add are needed.
+
+Let the layout set no cmdline. cmdline stays NULL, board_mtdparts_default()
+clears the variable, board_fdt_chosen_bootargs() returns NULL, fdt_chosen()
+leaves the FIT's /chosen/bootargs alone -- byte-for-byte the factory
+behaviour. `vendor_bootargs` (0004) is still there for anyone who wants to
+override the command line from the prompt.
+
+Requires 0001 .. 0004.
+
+Apply with:
+    git apply 0005-uboot-multi-layout-no-cmdline.patch
+Fallback if your tree normalises EOLs differently:
+    git apply --ignore-whitespace 0005-uboot-multi-layout-no-cmdline.patch
+    patch -p1 -l < 0005-uboot-multi-layout-no-cmdline.patch
+
+---
+diff --git a/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts b/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
+index 95c4752..f91c170 100644
+--- a/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
++++ b/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
+@@ -25,39 +25,51 @@
+ 	/*
+ 	 * Two partition maps for one board, selected at run time through the
+ 	 * `mtd_layout_label` environment variable (web UI: 高级功能 -> MTD 布局).
+-	 *
+-	 * The first five partitions are identical in both, so BL2 and the FIP
+-	 * never move: only the size of the UBI partition changes. Nothing in
++	 * The first five partitions are identical in both maps, so BL2 and the FIP
++	 * never move: only the size of the UBI partition changes, and nothing in
+ 	 * the boot chain outside U-Boot has to know which map is active.
++	 *
++	 * Neither map sets `cmdline`, and that is deliberate.
++	 *
++	 * The factory bootloader installs *no* `bootargs` variable at all -- the
++	 * only mtd-related string in its FIP is an explicit
++	 *     nmbm0:1024k(bl2),512k(u-boot-env),2048k(factory),256k(bdinfo),
++	 *           2048k(fip),235520k(ubi)
++	 * -- and the factory kernel is started with nothing but the
++	 * /chosen/bootargs its own FIT carries:
++	 *     console=ttyS0,115200n1 loglevel=8 earlycon=uart8250,mmio32,0x11002000
++	 * (the FIT also spells the UBI volume names out: kernel / rootfs /
++	 * rootfs_data). Whatever was appended on top of that -- ubi.rootfs_volume,
++	 * the boot_param.* set -- is not needed to boot the factory image.
++	 *
++	 * board_mtdparts_default() clears the `bootargs` variable when the active
++	 * layout has no `cmdline` property, and fdt_chosen() then leaves the FIT's
++	 * own /chosen/bootargs untouched, so this reproduces the factory behaviour
++	 * exactly.
++	 *
++	 * If a command line is wanted after all, set `vendor_bootargs`: the vendor
++	 * boot path replaces `bootargs` with it verbatim, one setenv and no
++	 * rebuild.
+ 	 */
+ 	mtd-layout {
+ 		/*
+-		 * layout@0 -- Cudy factory layout.
+-		 *
+-		 * Byte for byte the map the stock bootloader hands to the stock
+-		 * firmware, so an image written by this U-Boot boots with exactly
+-		 * the partitioning it was built for, and UBI keeps the size it
+-		 * already has on the flash.
++		 * layout@0 -- the factory map, and the map the OpenWrt /
++		 * ImmortalWrt images for this board are built against.
+ 		 *
+-		 * The stock images carry only their console settings in
+-		 * /chosen/bootargs -- everything else used to live in the factory
+-		 * environment, which does not survive another firmware writing the
+-		 * env partition. Supply it here instead. `ubi.mtd` is what makes
+-		 * the kernel attach the UBI device; the rootfs volume itself is
+-		 * resolved by the kernel's own default rootdev logic, so there is
+-		 * deliberately no `root=`.
++		 * `-(ubi)` expands to "everything the NMBM device has left", which
++		 * is the 235520 KiB the factory mtdparts string spells out
++		 * explicitly.
+ 		 */
+ 		layout@0 {
+ 			label = "default";
+ 			mtdids = "nmbm0=nmbm0";
+ 			mtdparts = "nmbm0:1024k(bl2),512k(u-boot-env),2048k(Factory),256k(bdinfo),2048k(fip),-(ubi)";
+-			cmdline = "console=ttyS0,115200n1 loglevel=8 ubi.mtd=ubi";
+ 		};
+ 
+ 		/*
+-		 * layout@1 -- 112 MiB UBI, the layout the ubootmod / 112m-nmbm
+-		 * images for this board expect. Those bring a complete command
+-		 * line of their own, so none is set here.
++		 * layout@1 -- 112 MiB UBI, for images built against the 112m-nmbm
++		 * map. Smaller than the factory UBI, so switching to it never moves
++		 * anything below it.
+ 		 */
+ 		layout@1 {
+ 			label = "112m";
