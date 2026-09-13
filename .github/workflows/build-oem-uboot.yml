@@ -34,6 +34,7 @@ env:
   PATCH_FILES: >-
     0001-uboot-add-oem-firmware-restore.patch
     0002-uboot-boot-vendor-layout.patch
+    0003-uboot-auto-split-vendor-image.patch
 
 jobs:
   build:
@@ -97,7 +98,13 @@ jobs:
           grep -q 'bootargs_set("ubi.rootfs_volume"'   "$C/mtd_helper.c"
           grep -q 'bootargs_set("boot_param.rootfs_data_part"' "$C/mtd_helper.c"
 
-          echo "==> 补丁校验通过：两个补丁全部命中"
+          # ---- 0003：原厂整包自动切割 + 修掉删卷隐患 ----
+          grep -q "find_ubi_payload"           "$C/bootmenu_mtd_common.c"
+          grep -q "ubi_peb_guess"              "$C/bootmenu_mtd_common.c"
+          grep -q "memset(&ii, 0, sizeof(ii))" "$C/mtd_helper.c"
+          grep -qF 'if (!ret && ii.header_type == HEADER_FIT)' "$C/mtd_helper.c"
+
+          echo "==> 补丁校验通过：三个补丁全部命中"
 
       - name: 编译 FIP
         run: |
