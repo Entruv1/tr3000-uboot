@@ -1,19 +1,28 @@
-# 云端编译「能按官方布局引导、也能安全刷原厂固件」的 U-Boot（FIP）
+# 云端编译「一个 U-Boot 通吃」的 Cudy TR3000 v1 256MB 固件（FIP）
 #
 # 用法：
 #   1. 本文件放到仓库的 .github/workflows/ 下
-#   2. 0001-uboot-add-oem-firmware-restore.patch 与
-#      0002-uboot-boot-vendor-layout.patch 放到仓库根目录
+#   2. 0001..0004 四个补丁放到仓库根目录
 #   3. Actions -> Build OEM-flashable U-Boot (FIP) -> Run workflow
 #
 # 产物：Artifacts 里的
-#   fip-mt7981_cudy_tr3000-v1-256mb_2025-Yuzhii-dhcpd-fixed-parts_md5-<hash>.bin
-#   bl2-mt7981_cudy_tr3000-v1-256mb_2025_md5-<hash>.bin
+#   fip-mt7981_cudy_tr3000-v1-256mb_2025-Yuzhihii-dhcpd-fixed-parts-multi-layout_md5-<hash>.bin
+#   （若 ATF 配置要求，还会带 bl2-*.bin）
 #
-# 两个补丁的分工：
+# 四个补丁的分工：
 #   0001  让网页 failsafe 能「原样直写」整份原厂 UBI 镜像（写进去不被抹掉）
-#   0002  让这台 U-Boot 真的会去引导：补回缺失的 bootcmd，并在引导原厂
-#         kernel 卷时自己补上 MTK 的 UBI rootfs 参数
+#   0002  让这台 U-Boot 真的会去引导：补回缺失的 bootcmd
+#   0003  上传原厂整包（FIP+UBI）时自动切割出 UBI 载荷再直写
+#   0004  Cudy TR3000 256MB 的多布局支持（MULTI_LAYOUT）：
+#         · 新增 mt7981_cudy_tr3000-v1-256mb_multi_layout_defconfig
+#         · DTS 增加 /mtd-layout（default = 原厂分区 + 原厂命令行；112m = 大分区）
+#         · vendor 引导命令行改由布局提供，并可用 env `vendor_bootargs` 现场覆盖
+#
+# 为什么开 MULTI_LAYOUT：
+#   上游 bl-mt798x-dhcpd 本来就内置 CONFIG_MEDIATEK_MULTI_MTD_LAYOUT —— DTS 里为
+#   同一块板定义多套分区表，运行时用 env `mtd_layout_label` 选一套，网页刷机时
+#   也能选目标布局（/getmtdlayout + /upload 的 mtd_layout 字段）。128MB 版 Cudy
+#   TR3000 上游已经支持，256MB 版没有，0004 把它补齐。
 
 name: Build OEM-flashable U-Boot (FIP)
 
@@ -29,12 +38,18 @@ env:
   # 想升级上游时，改这里并重新跑一次「校验补丁已生效」那一步确认即可。
   UPSTREAM_REF: f6b361ed80012244b1ed33be1b5080b4d65e83fb
   BOARD: cudy_tr3000-v1-256mb
+  SOC: mt7981
   FIP_VERSION: "2025"
   VARIANT: default
+  FIXED_MTDPARTS: "1"
+  MULTI_LAYOUT: "1"
+  # build.sh 找不到 multi-layout defconfig 时会 read 等待输入；CI 里没有 stdin。
+  SILENT: "Y"
   PATCH_FILES: >-
     0001-uboot-add-oem-firmware-restore.patch
     0002-uboot-boot-vendor-layout.patch
     0003-uboot-auto-split-vendor-image.patch
+    0004-uboot-multi-layout-cudy-256mb.patch
 
 jobs:
   build:
@@ -84,7 +99,8 @@ jobs:
       - name: 校验补丁已生效
         run: |
           set -e
-          C=src/uboot-mtk-20250711/board/mediatek/common
+          U=src/uboot-mtk-20250711
+          C=$U/board/mediatek/common
 
           # ---- 0001：原样直写原厂整包 UBI ----
           grep -q "mtd_part_has_ubi_image" "$C/mtd_helper.c"
@@ -92,11 +108,9 @@ jobs:
           grep -q "generic_mtd_write_oem"  "$C/bootmenu_common.h"
           grep -q 'abbr = "oem"'           "$C/bootmenu_mtd.c"
 
-          # ---- 0002：真的会引导 + 补上原厂 rootfs 参数 ----
+          # ---- 0002：真的会引导 + vendor 引导参数钩子 ----
           grep -q 'env_set("bootcmd", "mtkboardboot")' "$C/bootmenu_mtd.c"
           grep -q "mtd_vendor_bootargs_setup"          "$C/mtd_helper.c"
-          grep -q 'bootargs_set("ubi.rootfs_volume"'   "$C/mtd_helper.c"
-          grep -q 'bootargs_set("boot_param.rootfs_data_part"' "$C/mtd_helper.c"
 
           # ---- 0003：原厂整包自动切割 + 修掉删卷隐患 ----
           grep -q "find_ubi_payload"           "$C/bootmenu_mtd_common.c"
@@ -104,25 +118,41 @@ jobs:
           grep -q "memset(&ii, 0, sizeof(ii))" "$C/mtd_helper.c"
           grep -qF 'if (!ret && ii.header_type == HEADER_FIT)' "$C/mtd_helper.c"
 
-          echo "==> 补丁校验通过：三个补丁全部命中"
+          # ---- 0004：Cudy TR3000 256MB 多布局 ----
+          MLCFG="$U/configs/mt7981_cudy_tr3000-v1-256mb_multi_layout_defconfig"
+          test -f "$MLCFG"
+          grep -q "CONFIG_MEDIATEK_MULTI_MTD_LAYOUT=y" "$MLCFG"
+          grep -q "CONFIG_CMD_SHOW_MTD_LAYOUT=y"      "$MLCFG"
+          ! grep -q "MTDPARTS_DEFAULT"                "$MLCFG"
+          grep -q "mtd-layout"                                  "$U/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts"
+          grep -q 'label = "112m"'                              "$U/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts"
+          grep -q 'cmdline = "console=ttyS0'                    "$U/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts"
+          grep -q "vendor_bootargs"                             "$C/mtd_helper.c"
+          # 走 UBIFS 去挂 squashfs 的那组参数必须已经拿掉
+          ! grep -q 'bootargs_set("ubi.rootfs_volume"'         "$C/mtd_helper.c"
+
+          echo "==> 补丁校验通过：四个补丁全部命中"
 
       - name: 编译 FIP
         run: |
           set -eo pipefail
           cd src
-          BOARD="$BOARD" VERSION="$FIP_VERSION" VARIANT="$VARIANT" \
-            MULTI_LAYOUT=0 FIXED_MTDPARTS=1 ./build.sh 2>&1 | tee ../build.log
+          BOARD="$BOARD" SOC="$SOC" VERSION="$FIP_VERSION" VARIANT="$VARIANT" \
+            MULTI_LAYOUT="$MULTI_LAYOUT" FIXED_MTDPARTS="$FIXED_MTDPARTS" \
+            SILENT="$SILENT" ./build.sh 2>&1 | tee ../build.log
 
       - name: 打印关键信息
         if: always()
         run: |
           grep -m1 "Features:" build.log || true
+          grep -m1 "U-Boot CFG:" build.log || true
+          grep -m1 "VARIANT:" build.log || true
           ls -l src/output || true
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: fip-cudy-tr3000-v1-256mb-oem-capable
+          name: fip-cudy-tr3000-v1-256mb-multi-layout
           path: |
             src/output/*.bin
             build.log
