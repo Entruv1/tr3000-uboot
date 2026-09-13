@@ -1,0 +1,93 @@
+From: custom
+Subject: [PATCH] mt7981 cudy tr3000 256mb: pin the factory ubi partition to 235520k
+
+The "default" layout let the UBI partition size fall out of `-(ubi)`:
+
+    mtdparts = "...2048k(fip),-(ubi)";
+
+`-(ubi)` expands to whatever the NMBM device has left, and that depends on
+how many blocks *this* U-Boot reserved for NMBM. The factory bootloader and
+the factory device tree both use a fixed 235520 KiB:
+
+  * the only mtd literal inside the factory FIP is
+
+        nmbm0:1024k(bl2),512k(u-boot-env),2048k(factory),256k(bdinfo),2048k(fip),235520k(ubi)
+
+  * the factory kernel device tree, taken out of the factory UBI, has
+
+        partition@5C0000 { label = "ubi"; reg = <0x5c0000 0xe600000>; }
+
+    0xe600000 = 235520 KiB, and the five partitions below it line up
+    byte for byte with the U-Boot side.
+
+This U-Boot reserves fewer NMBM blocks than the factory one, so `-(ubi)`
+lands a few MiB *above* 235520 KiB. U-Boot then attaches the UBI over a
+range reaching past the end of the real UBI, adopts the blank trailing
+erase blocks as free space, and relocates the volume table. The kernel
+still sees a 235520 KiB partition from its own device tree and can no
+longer find that table:
+
+    ubi0 error: ubi_read_volume_table: the layout volume was not found
+    ubi0 error: ubi_attach_mtd_dev: failed to attach mtd6, error -22
+    Kernel panic - not syncing: VFS: Unable to mount root fs
+    Rebooting in 1 seconds..
+
+which is exactly the boot loop this board shows. It is also why rewriting
+the firmware does not help: the bootloader keeps re-adopting the same
+oversized range.
+
+Spell the size out. 235520k is what the factory mtdparts says, what the
+factory device tree says and what the UBI on the flash was created with;
+the remaining bytes up to the end of nmbm0 are simply left unclaimed.
+
+The 112m layout already uses an explicit size and is untouched.
+
+Requires 0001 .. 0005.
+
+Apply with:
+    git apply 0006-uboot-pin-factory-ubi-size.patch
+Fallback if your tree normalises EOLs differently:
+    git apply --ignore-whitespace 0006-uboot-pin-factory-ubi-size.patch
+    patch -p1 -l < 0006-uboot-pin-factory-ubi-size.patch
+
+---
+diff --git a/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts b/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
+index f91c170..88bc314 100644
+--- a/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
++++ b/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
+@@ -56,14 +56,31 @@
+ 		 * layout@0 -- the factory map, and the map the OpenWrt /
+ 		 * ImmortalWrt images for this board are built against.
+ 		 *
+-		 * `-(ubi)` expands to "everything the NMBM device has left", which
+-		 * is the 235520 KiB the factory mtdparts string spells out
+-		 * explicitly.
++		 * The UBI size is spelled out instead of left to `-(ubi)`, and
++		 * that matters more than it looks.
++		 *
++		 * `-(ubi)` means "everything the NMBM device has left", and how
++		 * much that is depends on how many blocks *this* bootloader
++		 * reserved for NMBM -- not on how many the factory one reserved.
++		 * The two do not agree here, so `-(ubi)` comes out larger than the
++		 * 235520 KiB the factory bootloader and the factory device tree
++		 * both use. U-Boot would then attach the UBI over a range running
++		 * past the end of the real UBI, take the blank trailing erase
++		 * blocks for free space and relocate the volume table -- after
++		 * which the kernel, which still sees a 235520 KiB partition in its
++		 * own device tree, cannot find it any more:
++		 *
++		 *     ubi0 error: ubi_read_volume_table: the layout volume was not found
++		 *     ubi0 error: ubi_attach_mtd_dev: failed to attach mtd6, error -22
++		 *     Kernel panic - not syncing: VFS: Unable to mount root fs
++		 *
++		 * So pin the partition to the factory size and leave the slack
++		 * between it and the end of nmbm0 unclaimed.
+ 		 */
+ 		layout@0 {
+ 			label = "default";
+ 			mtdids = "nmbm0=nmbm0";
+-			mtdparts = "nmbm0:1024k(bl2),512k(u-boot-env),2048k(Factory),256k(bdinfo),2048k(fip),-(ubi)";
++			mtdparts = "nmbm0:1024k(bl2),512k(u-boot-env),2048k(Factory),256k(bdinfo),2048k(fip),235520k(ubi)";
+ 		};
+ 
+ 		/*
