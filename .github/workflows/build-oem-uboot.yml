@@ -1,28 +1,25 @@
 # 云端编译「一个 U-Boot 通吃」的 Cudy TR3000 v1 256MB 固件（FIP）
 #
 # 用法：
-#   1. 本文件放到仓库的 .github/workflows/ 下
-#   2. 0001..0006 六个补丁放到仓库根目录
+#   1. 本文件放在仓库的 .github/workflows/ 下
+#   2. 0001..0006 六个补丁放在仓库根目录
 #   3. Actions -> Build OEM-flashable U-Boot (FIP) -> Run workflow
 #
 # 产物：Artifacts 里的
-#   fip-mt7981_cudy_tr3000-v1-256mb_2025-Yuzhihii-dhcpd-fixed-parts-multi-layout_md5-<hash>.bin
-#   （若 ATF 配置要求，还会带 bl2-*.bin）
+#   fip-mt7981_cudy_tr3000-v1-256mb_2025-Yuzhii-dhcpd-fixed-parts-multi-layout_md5-<hash>.bin
+#   （以及 MD5SUMS.txt；同一个 zip 里的 bl2-*.bin 不要刷，本仓库补丁不涉及 BL2）
 #
 # 六个补丁的分工：
-#   0001  让网页 failsafe 能「原样直写」整份原厂 UBI 镜像（写进去不被抹掉）
+#   0001  让网页 failsafe 能「原样直写」整份原厂 UBI 镜像（写进去不被 U-Boot 自己擦掉）
 #   0002  让这台 U-Boot 真的会去引导：补回缺失的 bootcmd
-#   0003  上传原厂整包（FIP+UBI）时自动切割出 UBI 载荷再直写
+#   0003  上传原厂整包（FIP + UBI）时自动切割出 UBI 载荷再直写
 #   0004  Cudy TR3000 256MB 的多布局支持（MULTI_LAYOUT）：
 #         · 新增 mt7981_cudy_tr3000-v1-256mb_multi_layout_defconfig
 #         · DTS 增加 /mtd-layout（default = 原厂分区；112m = 112MiB 大分区）
 #         · vendor 引导命令行改由布局提供，并可用 env `vendor_bootargs` 现场覆盖
-#   0005  去掉 0004 给 default 布局写的那条 cmdline —— 挖过原厂 FIP 和原厂 UBI
-#         之后确认：原厂 U-Boot 压根不设 bootargs，原厂内核收到的就是 FIT 自带
-#         的 /chosen/bootargs（只有 console + earlycon）。env 一旦有 bootargs，
-#         fdt_chosen() 就会整体替换掉 FIT 那条，属于纯多余的偏离。
-#         删掉后：cmdline == NULL -> env 变量被清 -> FIT 命令行原封不动，
-#         与原厂 U-Boot 行为逐位一致。
+#   0005  去掉 0004 给 default 布局写的那条 cmdline —— 原厂 U-Boot 压根不设
+#         bootargs，原厂内核收到的就是 FIT 自带的 /chosen/bootargs。env 一旦有
+#         bootargs，fdt_chosen() 就会整体替换掉 FIT 那条，属于纯多余的偏离。
 #   0006  把 default 布局的 ubi 分区从 `-(ubi)` 改成写死的 235520k。
 #         这是**真正卡住引导的那一处**：`-(ubi)` = "占完 NMBM 剩余全部"，
 #         它的值取决于本 U-Boot 预留了多少 NMBM 块，与原厂不一致（本机更大）。
@@ -32,16 +29,16 @@
 #             ubi0 error: ubi_read_volume_table: the layout volume was not found
 #             ubi0 error: ubi_attach_mtd_dev: failed to attach mtd6, error -22
 #         235520k 由三处独立证据共同确认：原厂 FIP 内置 mtdparts、原厂内核
-#         DTB 的 partition@5C0000，以及 flash 上那套 UBI 本身就是按它建起来的。
+#         DTB 的 partition@5C0000，以及 OpenWrt 官方 256MB 机型定义（IMAGE_SIZE）。
 #
 # 为什么开 MULTI_LAYOUT：
 #   上游 bl-mt798x-dhcpd 本来就内置 CONFIG_MEDIATEK_MULTI_MTD_LAYOUT —— DTS 里为
 #   同一块板定义多套分区表，运行时用 env `mtd_layout_label` 选一套，网页刷机时
 #   也能选目标布局（/getmtdlayout + /upload 的 mtd_layout 字段）。128MB 版 Cudy
 #   TR3000 上游已经支持，256MB 版没有，0004 把它补齐。
-#   注：原厂 FIP 里那条 mtdparts 用的就是写死的 235520k，所以这块板的多布局
-#   价值主要在「命令行可控」与「可选 112m 大分区」，分区表本身两边本来就该一致
-#   —— 0006 之前用 `-(ubi)` 反而把这份一致性破坏了。
+#
+# 注意：存盘 env 里的 `mtdparts` 优先级高于设备树。若 u-boot-env 里躺着旧的
+# `-(ubi)`，0006 会被它整个盖住 —— 详见 README 第六节第 2 步。
 
 name: Build OEM-flashable U-Boot (FIP)
 
@@ -176,6 +173,11 @@ jobs:
             MULTI_LAYOUT="$MULTI_LAYOUT" FIXED_MTDPARTS="$FIXED_MTDPARTS" \
             SILENT="$SILENT" ./build.sh 2>&1 | tee ../build.log
 
+      - name: 生成校验和
+        run: |
+          set -e
+          (cd src/output && md5sum *.bin > MD5SUMS.txt && cat MD5SUMS.txt)
+
       - name: 打印关键信息
         if: always()
         run: |
@@ -187,9 +189,10 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: fip-cudy-tr3000-v1-256mb-multi-layout-v3
+          name: fip-cudy-tr3000-v1-256mb-multi-layout
           path: |
             src/output/*.bin
+            src/output/MD5SUMS.txt
             build.log
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
