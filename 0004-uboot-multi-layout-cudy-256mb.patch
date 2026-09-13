@@ -1,0 +1,294 @@
+From: custom
+Subject: [PATCH] mt7981 cudy tr3000 256mb: multi mtd layout + switchable vendor bootargs
+
+Upstream already ships the machinery for "one U-Boot, several partition maps":
+a board DTS lists them under /mtd-layout, board_mtdparts_default() picks one by
+the `mtd_layout_label` environment variable, and the web failsafe can switch it
+from the upgrade page. The 128 MiB Cudy TR3000 has that support
+(configs/mt7981_cudy_tr3000-v1_multi_layout_defconfig); the 256 MiB variant
+does not, and its DTS has no /mtd-layout node at all.
+
+Add it, and while at it stop hard-coding the vendor command line:
+
+  * configs/mt7981_cudy_tr3000-v1-256mb_multi_layout_defconfig (new)
+    Same as the plain 256 MiB defconfig, minus MTDIDS_DEFAULT/MTDPARTS_DEFAULT
+    (the layouts provide them now), plus MEDIATEK_MULTI_MTD_LAYOUT and
+    CMD_SHOW_MTD_LAYOUT.
+
+  * arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
+    /mtd-layout with
+      layout@0 "default" -- the Cudy factory map, plus the command line the
+                            stock images do not carry themselves
+      layout@1 "112m"    -- 112 MiB UBI for the ubootmod / 112m-nmbm images
+    The first five partitions are identical in both maps, so BL2 and the FIP
+    never move and only the UBI size changes.
+
+  * board/mediatek/common/mtd_helper.c
+    mtd_vendor_bootargs_setup() used to clear "bootargs" and inject
+    ubi.rootfs_volume=rootfs plus a set of boot_param.* entries. That makes the
+    kernel look for its root filesystem the UBIFS way while the volume actually
+    holds squashfs, which ends in an endless reboot loop. The command line now
+    comes from the active layout (which is also what the stock layouts upstream
+    do -- their default layout sets the console settings and nothing else), and
+    the new `vendor_bootargs` variable can replace it verbatim, so trying
+    another parameter set costs one setenv + mtkboardboot instead of a rebuild.
+
+Requires 0001, 0002 and 0003.
+
+Apply with:
+    git apply 0004-uboot-multi-layout-cudy-256mb.patch
+Fallback if your tree normalises EOLs differently:
+    git apply --ignore-whitespace 0004-uboot-multi-layout-cudy-256mb.patch
+    patch -p1 -l < 0004-uboot-multi-layout-cudy-256mb.patch
+
+---
+diff --git a/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts b/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
+index 6e690b4..95c4752 100644
+--- a/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
++++ b/uboot-mtk-20250711/arch/arm/dts/mt7981-cudy-tr3000-v1-256mb.dts
+@@ -22,6 +22,50 @@
+ 		system_led = "red:power";
+ 	};
+ 
++	/*
++	 * Two partition maps for one board, selected at run time through the
++	 * `mtd_layout_label` environment variable (web UI: 高级功能 -> MTD 布局).
++	 *
++	 * The first five partitions are identical in both, so BL2 and the FIP
++	 * never move: only the size of the UBI partition changes. Nothing in
++	 * the boot chain outside U-Boot has to know which map is active.
++	 */
++	mtd-layout {
++		/*
++		 * layout@0 -- Cudy factory layout.
++		 *
++		 * Byte for byte the map the stock bootloader hands to the stock
++		 * firmware, so an image written by this U-Boot boots with exactly
++		 * the partitioning it was built for, and UBI keeps the size it
++		 * already has on the flash.
++		 *
++		 * The stock images carry only their console settings in
++		 * /chosen/bootargs -- everything else used to live in the factory
++		 * environment, which does not survive another firmware writing the
++		 * env partition. Supply it here instead. `ubi.mtd` is what makes
++		 * the kernel attach the UBI device; the rootfs volume itself is
++		 * resolved by the kernel's own default rootdev logic, so there is
++		 * deliberately no `root=`.
++		 */
++		layout@0 {
++			label = "default";
++			mtdids = "nmbm0=nmbm0";
++			mtdparts = "nmbm0:1024k(bl2),512k(u-boot-env),2048k(Factory),256k(bdinfo),2048k(fip),-(ubi)";
++			cmdline = "console=ttyS0,115200n1 loglevel=8 ubi.mtd=ubi";
++		};
++
++		/*
++		 * layout@1 -- 112 MiB UBI, the layout the ubootmod / 112m-nmbm
++		 * images for this board expect. Those bring a complete command
++		 * line of their own, so none is set here.
++		 */
++		layout@1 {
++			label = "112m";
++			mtdids = "nmbm0=nmbm0";
++			mtdparts = "nmbm0:1024k(bl2),512k(u-boot-env),2048k(Factory),256k(bdinfo),2048k(fip),114688k(ubi)";
++		};
++	};
++
+ 	memory@40000000 {
+ 		device_type = "memory";
+ 		reg = <0x40000000 0x20000000>;
+diff --git a/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c b/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
+index d48f197..282747d 100644
+--- a/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
++++ b/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
+@@ -1411,47 +1411,49 @@ static int ubi_dual_boot(struct mtd_info *mtd, bool do_boot)
+ }
+ 
+ /*
+- * Vendor images (the stock MTK-SDK / OpenWrt firmware) keep the kernel FIT in
+- * the UBI volume named "kernel" and the squashfs root filesystem in the
+- * volume named "rootfs". Their embedded /chosen/bootargs carries only the
+- * console settings -- the kernel has to be *told* which UBI volume is the
+- * root filesystem, through the MTK parameters below.
++ * Vendor images (the stock MTK-SDK / Cudy firmware) keep the kernel FIT in the
++ * UBI volume named "kernel" and the squashfs root filesystem in the volume
++ * named "rootfs".
+  *
+- * On the stock bootloader those parameters come from a factory environment
+- * that stops existing as soon as anything else writes the env partition, and
+- * the kernel then panics with "VFS: Unable to mount root fs" and reboot-loops
+- * forever. Rebuild them here.
++ * Their embedded /chosen/bootargs carries the console settings only, and on
++ * the stock bootloader the parameters that tell the kernel where its root
++ * filesystem lives came from a factory environment that stops existing as
++ * soon as anything else writes the env partition. Without a command line the
++ * kernel cannot find its root and reboot-loops forever.
++ *
++ * The command line now comes from the active mtd layout (the `cmdline`
++ * property of /mtd-layout in the board DTS), which board_mtdparts_default()
++ * has already exported through the `bootargs` variable by the time we get
++ * here. Nothing is appended or cleared, so the layout -- or the operator --
++ * remains in charge.
+  *
+  * Only the "kernel" volume is affected. Images booted from the "fit" volume
+  * (our own layout, and OpenWrt's ubootmod) carry a complete command line of
+  * their own and are deliberately left alone.
+- *
+- * The values mirror what MediaTek's own ubi_set_bootargs() puts on the kernel
+- * command line for a non-secure-boot build -- note there is no 'root=': the
+- * kernel resolves the root filesystem from ubi.rootfs_volume itself.
+  */
+ static void mtd_vendor_bootargs_setup(void)
+ {
++	const char *override;
++
+ 	if (!ubi_image_vol || strcmp(ubi_image_vol, PART_KERNEL_NAME))
+ 		return;
+ 
+-	cprintln(PROMPT, "*** Vendor '%s' volume found: supplying MTK UBI bootargs ***",
+-		 PART_KERNEL_NAME);
+-
+ 	/*
+-	 * A stale command line from a previous firmware would otherwise be
+-	 * applied on top of ours by fdt_chosen(), so start from a clean slate.
++	 * `vendor_bootargs` replaces the layout's command line as-is. Trying a
++	 * different parameter set is then a single setenv plus mtkboardboot,
++	 * instead of a firmware rebuild.
+ 	 */
+-	env_set("bootargs", NULL);
+-
+-	bootargs_set("ubi.mtd", PART_UBI_NAME);
+-	bootargs_set("ubi.rootfs_volume", "rootfs");
+-	bootargs_set("boot_param.boot_kernel_part", PART_KERNEL_NAME);
+-	bootargs_set("boot_param.boot_rootfs_part", "rootfs");
+-	bootargs_set("boot_param.upgrade_kernel_part", PART_KERNEL_NAME);
+-	bootargs_set("boot_param.upgrade_rootfs_part", "rootfs");
+-	bootargs_set("boot_param.env_part", CONFIG_ENV_MTD_DEV);
+-	bootargs_set("boot_param.rootfs_data_part", PART_ROOTFS_DATA_NAME);
++	override = env_get("vendor_bootargs");
++	if (override && override[0]) {
++		cprintln(PROMPT, "*** vendor_bootargs override: %s ***", override);
++		env_set("bootargs", override);
++		return;
++	}
++
++	cprintln(PROMPT, "*** Booting vendor '%s' volume with the layout command line ***",
++		 PART_KERNEL_NAME);
++	cprintln(PROMPT, "*** bootargs: %s ***",
++		 env_get("bootargs") ? env_get("bootargs") : "(unset)");
+ }
+ 
+ static int boot_from_ubi(struct mtd_info *mtd, bool do_boot)
+diff --git a/uboot-mtk-20250711/configs/mt7981_cudy_tr3000-v1-256mb_multi_layout_defconfig b/uboot-mtk-20250711/configs/mt7981_cudy_tr3000-v1-256mb_multi_layout_defconfig
+new file mode 100644
+index 0000000..2043cbd
+--- /dev/null
++++ b/uboot-mtk-20250711/configs/mt7981_cudy_tr3000-v1-256mb_multi_layout_defconfig
+@@ -0,0 +1,107 @@
++CONFIG_ARM=y
++CONFIG_SYS_HAS_NONCACHED_MEMORY=y
++CONFIG_POSITION_INDEPENDENT=y
++CONFIG_ARCH_MEDIATEK=y
++CONFIG_TEXT_BASE=0x41e00000
++CONFIG_SYS_MALLOC_F_LEN=0x4000
++CONFIG_NR_DRAM_BANKS=1
++CONFIG_ENV_SIZE=0x20000
++CONFIG_ENV_OFFSET=0x0
++CONFIG_DEFAULT_DEVICE_TREE="mt7981-cudy-tr3000-v1-256mb"
++CONFIG_SYS_PROMPT="MT7981> "
++CONFIG_TARGET_MT7981=y
++CONFIG_DEBUG_UART_BASE=0x11002000
++CONFIG_DEBUG_UART_CLOCK=40000000
++CONFIG_SYS_LOAD_ADDR=0x46000000
++CONFIG_DEBUG_UART=y
++CONFIG_MEDIATEK_BOOTMENU=y
++CONFIG_MEDIATEK_BOOTMENU_DELAY=3
++CONFIG_MTK_WEB_FAILSAFE=y
++CONFIG_MTK_WEB_FAILSAFE_AFTER_BOOT_FAILURE=y
++CONFIG_MTK_UBI_SUPPORT=y
++CONFIG_MEDIATEK_MULTI_MTD_LAYOUT=y
++CONFIG_MTK_UPGRADE_BL2_VERIFY=y
++# CONFIG_MTK_UPGRADE_IMAGE_VERIFY is not set
++CONFIG_ENABLE_NAND_NMBM=y
++CONFIG_FIT=y
++CONFIG_AUTOBOOT_MENU_SHOW=y
++CONFIG_AUTOBOOT_MENU_MTK_SHOW=y
++CONFIG_DEFAULT_FDT_FILE="mt7981-spim-nand-rfb"
++CONFIG_LOGLEVEL=7
++CONFIG_LOG=y
++CONFIG_HUSH_PARSER=y
++CONFIG_SYS_CBSIZE=512
++CONFIG_SYS_PBSIZE=1049
++# CONFIG_BOOTM_NETBSD is not set
++# CONFIG_BOOTM_PLAN9 is not set
++# CONFIG_BOOTM_RTEMS is not set
++# CONFIG_BOOTM_VXWORKS is not set
++# CONFIG_CMD_ELF is not set
++CONFIG_CMD_MEMINFO=y
++# CONFIG_CMD_UNLZ4 is not set
++# CONFIG_CMD_UNZIP is not set
++CONFIG_CMD_GPIO=y
++CONFIG_CMD_GPIO_READ=y
++CONFIG_CMD_PWM=y
++CONFIG_CMD_MTD=y
++CONFIG_CMD_NMBM=y
++CONFIG_CMD_TFTPPUT=y
++CONFIG_CMD_PING=y
++CONFIG_CMD_SMC=y
++CONFIG_CMD_MTDPARTS=y
++CONFIG_CMD_SHOW_MTD_LAYOUT=y
++CONFIG_CMD_GL_BTN=y
++CONFIG_OF_EMBED=y
++CONFIG_ENV_OVERWRITE=y
++CONFIG_ENV_IS_IN_MTD=y
++CONFIG_ENV_MTD_NAME="u-boot-env"
++CONFIG_ENV_SIZE_REDUND=0x80000
++CONFIG_ENV_VARS_UBOOT_RUNTIME_CONFIG=y
++CONFIG_NET_RANDOM_ETHADDR=y
++CONFIG_USE_IPADDR=y
++CONFIG_IPADDR="192.168.1.1"
++CONFIG_USE_NETMASK=y
++CONFIG_NETMASK="255.255.255.0"
++CONFIG_USE_SERVERIP=y
++CONFIG_SERVERIP="192.168.1.2"
++CONFIG_PROT_TCP=y
++CONFIG_REGMAP=y
++CONFIG_SYSCON=y
++CONFIG_BUTTON=y
++CONFIG_BUTTON_GPIO=y
++CONFIG_CLK=y
++# CONFIG_I2C is not set
++CONFIG_LED=y
++CONFIG_LED_BLINK=y
++CONFIG_LED_GPIO=y
++# CONFIG_MMC is not set
++CONFIG_DM_MTD=y
++CONFIG_MTD_SPI_NAND=y
++CONFIG_PHY_FIXED=y
++CONFIG_MEDIATEK_ETH=y
++CONFIG_PINCTRL=y
++CONFIG_PINCONF=y
++CONFIG_PINCTRL_MT7981=y
++CONFIG_POWER_DOMAIN=y
++CONFIG_MTK_POWER_DOMAIN=y
++CONFIG_DM_REGULATOR=y
++CONFIG_DM_REGULATOR_FIXED=y
++CONFIG_DM_REGULATOR_GPIO=y
++CONFIG_DM_PWM=y
++CONFIG_PWM_MTK=y
++CONFIG_DM_SERIAL=y
++CONFIG_MTK_SERIAL=y
++CONFIG_SPI=y
++CONFIG_DM_SPI=y
++CONFIG_MTK_SPIM=y
++CONFIG_TIMER=y
++CONFIG_MTK_TIMER=y
++CONFIG_HEXDUMP=y
++CONFIG_MD5=y
++# CONFIG_CMD_XIMG is not set
++CONFIG_CMD_BOOTMENU=y
++CONFIG_ENV_MTD_DEV="u-boot-env"
++# CONFIG_DM_I2C is not set
++# CONFIG_I2C_SET_DEFAULT_BUS_NUM is not set
++# CONFIG_PCIE_MEDIATEK is not set
++# CONFIG_EFI_LOADER is not set
