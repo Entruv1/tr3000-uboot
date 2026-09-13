@@ -2,14 +2,14 @@
 #
 # 用法：
 #   1. 本文件放到仓库的 .github/workflows/ 下
-#   2. 0001..0005 五个补丁放到仓库根目录
+#   2. 0001..0006 六个补丁放到仓库根目录
 #   3. Actions -> Build OEM-flashable U-Boot (FIP) -> Run workflow
 #
 # 产物：Artifacts 里的
 #   fip-mt7981_cudy_tr3000-v1-256mb_2025-Yuzhihii-dhcpd-fixed-parts-multi-layout_md5-<hash>.bin
 #   （若 ATF 配置要求，还会带 bl2-*.bin）
 #
-# 五个补丁的分工：
+# 六个补丁的分工：
 #   0001  让网页 failsafe 能「原样直写」整份原厂 UBI 镜像（写进去不被抹掉）
 #   0002  让这台 U-Boot 真的会去引导：补回缺失的 bootcmd
 #   0003  上传原厂整包（FIP+UBI）时自动切割出 UBI 载荷再直写
@@ -23,14 +23,25 @@
 #         fdt_chosen() 就会整体替换掉 FIT 那条，属于纯多余的偏离。
 #         删掉后：cmdline == NULL -> env 变量被清 -> FIT 命令行原封不动，
 #         与原厂 U-Boot 行为逐位一致。
+#   0006  把 default 布局的 ubi 分区从 `-(ubi)` 改成写死的 235520k。
+#         这是**真正卡住引导的那一处**：`-(ubi)` = "占完 NMBM 剩余全部"，
+#         它的值取决于本 U-Boot 预留了多少 NMBM 块，与原厂不一致（本机更大）。
+#         U-Boot 于是以超出真实 UBI 的范围 attach，把尾部空白擦除块收编成
+#         free PEB 并挪动 volume table；而内核从自己的设备树里看到的仍是
+#         235520 KiB 的分区，于是再也找不到那张表：
+#             ubi0 error: ubi_read_volume_table: the layout volume was not found
+#             ubi0 error: ubi_attach_mtd_dev: failed to attach mtd6, error -22
+#         235520k 由三处独立证据共同确认：原厂 FIP 内置 mtdparts、原厂内核
+#         DTB 的 partition@5C0000，以及 flash 上那套 UBI 本身就是按它建起来的。
 #
 # 为什么开 MULTI_LAYOUT：
 #   上游 bl-mt798x-dhcpd 本来就内置 CONFIG_MEDIATEK_MULTI_MTD_LAYOUT —— DTS 里为
 #   同一块板定义多套分区表，运行时用 env `mtd_layout_label` 选一套，网页刷机时
 #   也能选目标布局（/getmtdlayout + /upload 的 mtd_layout 字段）。128MB 版 Cudy
 #   TR3000 上游已经支持，256MB 版没有，0004 把它补齐。
-#   注意：256MB 版的原厂分区表（FIP 里那条 nmbm0:...235520k(ubi)）与 `-(ubi)`
-#   等价，所以这块板的多布局价值主要在「命令行可控」而不在分区表本身。
+#   注：原厂 FIP 里那条 mtdparts 用的就是写死的 235520k，所以这块板的多布局
+#   价值主要在「命令行可控」与「可选 112m 大分区」，分区表本身两边本来就该一致
+#   —— 0006 之前用 `-(ubi)` 反而把这份一致性破坏了。
 
 name: Build OEM-flashable U-Boot (FIP)
 
@@ -59,6 +70,7 @@ env:
     0003-uboot-auto-split-vendor-image.patch
     0004-uboot-multi-layout-cudy-256mb.patch
     0005-uboot-multi-layout-no-cmdline.patch
+    0006-uboot-pin-factory-ubi-size.patch
 
 jobs:
   build:
@@ -137,7 +149,6 @@ jobs:
           grep -q "mtd-layout"                                  "$DTSF"
           grep -q 'label = "default"'                           "$DTSF"
           grep -q 'label = "112m"'                              "$DTSF"
-          grep -q 'nmbm0:1024k(bl2),512k(u-boot-env),2048k(Factory),256k(bdinfo),2048k(fip),-(ubi)' "$DTSF"
           grep -q "vendor_bootargs"                             "$C/mtd_helper.c"
           # 走 UBIFS 去挂 squashfs 的那组参数必须已经拿掉
           ! grep -q 'bootargs_set("ubi.rootfs_volume"'         "$C/mtd_helper.c"
@@ -147,7 +158,15 @@ jobs:
           # 原厂 U-Boot 不设 bootargs，所以这里也必须不设。
           ! grep -q 'cmdline ='                                 "$DTSF"
 
-          echo "==> 补丁校验通过：五个补丁全部命中"
+          # ---- 0006：ubi 分区钉死成原厂尺寸 235520k ----
+          # `-(ubi)` 算出来的值比原厂大，会让 U-Boot 把 UBI attach 到超出真实
+          # 范围的地方并挪动 volume table，内核随后找不到（见文件头 0006 说明）。
+          grep -q 'nmbm0:1024k(bl2),512k(u-boot-env),2048k(Factory),256k(bdinfo),2048k(fip),235520k(ubi)' "$DTSF"
+          ! grep -q '2048k(fip),-(ubi)'                          "$DTSF"
+          # 112m 布局不受 0006 影响，仍是写死的 114688k
+          grep -q '2048k(fip),114688k(ubi)'                      "$DTSF"
+
+          echo "==> 补丁校验通过：六个补丁全部命中"
 
       - name: 编译 FIP
         run: |
@@ -168,7 +187,7 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: fip-cudy-tr3000-v1-256mb-multi-layout-v2
+          name: fip-cudy-tr3000-v1-256mb-multi-layout-v3
           path: |
             src/output/*.bin
             build.log
