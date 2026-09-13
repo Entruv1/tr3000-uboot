@@ -1,0 +1,193 @@
+From: custom
+Subject: [PATCH] mt798x u-boot: flash a whole vendor sysupgrade package as-is
+
+The web failsafe (and "mtkupgrade fw") only ever inspect offset 0 of the
+uploaded file. A stock Cudy/MTK sysupgrade package is a bootloader FIP
+followed by a whole UBI image, so that offset holds the FIP magic and the
+flash stops with "*** Image not supported! ***" -- the file has to be cut by
+hand with a third-party tool before it can be used.
+
+Teach the web upgrade path to split such a package itself:
+
+  * bootmenu_mtd_common.c: find_ubi_payload()/ubi_peb_guess() locate the UBI
+    payload inside the uploaded image (byte-wise, since the payload is not
+    erase-block aligned inside the package), trim the trailing partial block
+    and hand the result to generic_mtd_write_oem(), i.e. the raw write path
+    added by 0001. generic_mtd_write_fw() tries the normal image parser first
+    and only falls back to splitting, so plain images and OpenWrt tar
+    packages keep taking exactly the same path as before.
+
+  * mtd_helper.c: mtd_upgrade_image() decides "is this a FIT image?" from an
+    uninitialised struct owrt_image_info when the parser failed, and runs
+    write_ubi_itb_image() -- which erases the partition and removes the
+    kernel/rootfs/rootfs_data volumes -- if the stale stack value happens to
+    equal HEADER_FIT (2). Add the missing !ret guard and zero the structure.
+
+Requires 0001 (raw OEM write path) and 0002 (vendor boot args) first.
+
+Apply with:
+    git apply 0003-uboot-auto-split-vendor-image.patch
+Fallback if your tree normalises EOLs differently:
+    git apply --ignore-whitespace 0003-uboot-auto-split-vendor-image.patch
+    patch -p1 -l < 0003-uboot-auto-split-vendor-image.patch
+
+---
+diff --git a/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd_common.c b/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd_common.c
+index 7e7cc7d..9aa5e5a 100644
+--- a/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd_common.c
++++ b/uboot-mtk-20250711/board/mediatek/common/bootmenu_mtd_common.c
+@@ -510,9 +510,95 @@ out:
+ 	return ret;
+ }
+ 
++/*
++ * Vendor "sysupgrade" packages are not plain images: Cudy ships a copy of the
++ * bootloader FIP in front of the actual UBI payload, so the very first bytes
++ * are the FIP magic and no UBI erase-counter header is ever seen at offset 0.
++ * The image parser (mtd_upgrade_image()/parse_image_ram()) only inspects
++ * offset 0, rejects the package outright and the flash ends with
++ * "*** Image not supported! ***".
++ *
++ * The payload is located here instead, the same way the vendor's own splitting
++ * tool does it, and handed to generic_mtd_write_oem() as a whole UBI image.
++ */
++#define UBI_EC_MAGIC		"UBI#"
++#define UBI_SCAN_MIN_BLOCK	0x1000u
++#define UBI_SCAN_MAX_BLOCK	0x40000u
++#define UBI_SCAN_MIN_BLOCKS	8
++
++/*
++ * Distance between the first two erase-counter magics, i.e. the erase block
++ * (PEB) size of the image. Only power-of-two sizes in the plausible NAND
++ * range are accepted; 0 means "cannot tell".
++ */
++static uint32_t ubi_peb_guess(const void *data, size_t size)
++{
++	const unsigned char *p = data;
++	size_t pos;
++
++	for (pos = 4; pos + 4 <= size && pos <= UBI_SCAN_MAX_BLOCK; pos++) {
++		if (memcmp(p + pos, UBI_EC_MAGIC, 4))
++			continue;
++
++		if (pos >= UBI_SCAN_MIN_BLOCK && pos <= UBI_SCAN_MAX_BLOCK &&
++		    !(pos & (pos - 1)))
++			return (uint32_t)pos;
++
++		break;
++	}
++
++	return 0;
++}
++
++/*
++ * Offset of the UBI payload inside an image, or (size_t)-1 when there is none.
++ *
++ * An image that starts with the magic is taken at face value. A candidate
++ * further in must prove itself by repeating the magic at a constant stride for
++ * UBI_SCAN_MIN_BLOCKS blocks in a row, which a bootloader or a filesystem does
++ * not do by accident.
++ */
++static size_t find_ubi_payload(const void *data, size_t size, uint32_t *peb)
++{
++	const unsigned char *p = data;
++	size_t off, i;
++	uint32_t stride;
++
++	for (off = 0; off + 4 <= size; off++) {
++		if (memcmp(p + off, UBI_EC_MAGIC, 4))
++			continue;
++
++		stride = ubi_peb_guess(p + off, size - off);
++		if (!stride)
++			continue;
++
++		if (off) {
++			if (off + (size_t)UBI_SCAN_MIN_BLOCKS * stride > size)
++				continue;
++
++			for (i = 1; i < UBI_SCAN_MIN_BLOCKS; i++) {
++				if (memcmp(p + off + i * (size_t)stride,
++					   UBI_EC_MAGIC, 4))
++					break;
++			}
++
++			if (i != UBI_SCAN_MIN_BLOCKS)
++				continue;
++		}
++
++		*peb = stride;
++
++		return off;
++	}
++
++	return (size_t)-1;
++}
++
+ int generic_mtd_write_fw(void *priv, const struct data_part_entry *dpe,
+ 			 const void *data, size_t size)
+ {
++	size_t off, len;
++	uint32_t peb;
+ 	int ret = 0;
+ 
+ 	/*
+@@ -523,8 +609,30 @@ int generic_mtd_write_fw(void *priv, const struct data_part_entry *dpe,
+ 		return generic_mtd_write_oem(priv, dpe, data, size);
+ 
+ 	ret = mtd_upgrade_image(data, size);
+-	if (ret)
+-		cprintln(ERROR, "*** Image not supported! ***");
++	if (!ret)
++		return 0;
++
++	/*
++	 * Nothing matched. A whole vendor sysupgrade package lands here: split
++	 * its UBI payload off and write that raw, so the stock image can be
++	 * uploaded as-is instead of having to be cut by hand first.
++	 */
++	off = find_ubi_payload(data, size, &peb);
++	if (off != (size_t)-1) {
++		/* A UBI image is a whole number of erase blocks. */
++		len = (size - off) & ~((size_t)peb - 1);
++
++		if (off)
++			cprintln(PROMPT, "*** OEM sysupgrade package detected ***");
++
++		cprintln(PROMPT, "*** UBI payload at 0x%zx (PEB 0x%x), writing 0x%zx bytes ***",
++			 off, peb, len);
++
++		return generic_mtd_write_oem(priv, dpe,
++					     (const unsigned char *)data + off, len);
++	}
++
++	cprintln(ERROR, "*** Image not supported! ***");
+ 
+ 	return ret;
+ }
+diff --git a/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c b/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
+index 8a0c214..d48f197 100644
+--- a/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
++++ b/uboot-mtk-20250711/board/mediatek/common/mtd_helper.c
+@@ -1755,6 +1755,12 @@ int mtd_upgrade_image(const void *data, size_t size)
+ 	struct mtd_info *mtd;
+ 	int ret;
+ 	const char *ubi_flash_part = PART_UBI_NAME;
++
++	/*
++	 * Never let an unrecognised image be classified from stack garbage:
++	 * parse_image_ram() leaves the structure untouched when parsing fails.
++	 */
++	memset(&ii, 0, sizeof(ii));
+ #endif
+ 
+ #ifdef CONFIG_CMD_UBI
+@@ -1822,7 +1828,7 @@ int mtd_upgrade_image(const void *data, size_t size)
+ #endif
+ 				return write_ubi2_tar_image(data, size, mtd);
+ 			}
+-			if (ii.header_type == HEADER_FIT)
++			if (!ret && ii.header_type == HEADER_FIT)
+ 				return write_ubi_itb_image(data, size, mtd);
+ 		}
+ 	}
